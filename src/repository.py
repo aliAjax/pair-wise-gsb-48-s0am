@@ -47,8 +47,42 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS make_up_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    responsible_seller TEXT NOT NULL,
+                    required_quantity INTEGER NOT NULL,
+                    shortage_quantity INTEGER NOT NULL,
+                    delivered_quantity INTEGER NOT NULL DEFAULT 0,
+                    due_date TEXT NOT NULL,
+                    breach_price REAL NOT NULL,
+                    penalty_rate REAL NOT NULL,
+                    penalty_days INTEGER NOT NULL DEFAULT 0,
+                    breach_amount REAL NOT NULL DEFAULT 0,
+                    compensation_confirmed INTEGER NOT NULL DEFAULT 0,
+                    compensation_reference TEXT NOT NULL DEFAULT '',
+                    fail_reason TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS make_up_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL REFERENCES make_up_tasks(id) ON DELETE CASCADE,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    quantity INTEGER NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_tasks_record ON make_up_tasks(record_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_open_task_per_record
+                    ON make_up_tasks(record_id)
+                    WHERE status IN ('open', 'breached');
+                CREATE INDEX IF NOT EXISTS idx_batches_task ON make_up_batches(task_id, id);
                 """
             )
 
@@ -56,6 +90,12 @@ class Repository:
     def _row(row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
         item["payload"] = json.loads(item["payload"])
+        return item
+
+    @staticmethod
+    def _task_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["compensation_confirmed"] = bool(item["compensation_confirmed"])
         return item
 
     def create(self, reference: str, state: str, payload: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
@@ -115,6 +155,135 @@ class Repository:
             result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
             connection.commit()
         return self._row(result)
+
+    # ------------------------------------------------------------------
+    # 失败处置
+    # ------------------------------------------------------------------
+
+    def open_task(self, record_id: int, expected_version: int, state: str, payload: Dict[str, Any], task: Dict[str, Any], actor_id: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        """失败：更新指令并在同一事务内创建唯一未关闭补券任务。"""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE records SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                (state, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, record_id),
+            )
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO make_up_tasks(record_id,status,responsible_seller,required_quantity,shortage_quantity,
+                        delivered_quantity,due_date,breach_price,penalty_rate,penalty_days,breach_amount,
+                        compensation_confirmed,compensation_reference,fail_reason,created_by,updated_by,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        record_id, task["status"], task["responsible_seller"], task["required_quantity"],
+                        task["shortage_quantity"], task["delivered_quantity"], task["due_date"], task["breach_price"],
+                        task["penalty_rate"], task["penalty_days"], task["breach_amount"],
+                        1 if task["compensation_confirmed"] else 0, task.get("compensation_reference", ""),
+                        payload.get("fail_reason", ""), actor_id, actor_id, now, now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                raise Conflict("该指令已存在未关闭的补券任务") from exc
+            task_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "fail", actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            task_row = connection.execute("SELECT * FROM make_up_tasks WHERE id=?", (task_id,)).fetchone()
+            connection.commit()
+        return {"record": self._row(result), "task": self._task_row(task_row)}
+
+    def get_open_task(self, record_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM make_up_tasks WHERE record_id=? AND status IN ('open','breached') ORDER BY id DESC",
+                (record_id,),
+            ).fetchone()
+        return self._task_row(row) if row is not None else None
+
+    def get_task(self, task_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM make_up_tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            raise NotFound("补券任务不存在")
+        return self._task_row(row)
+
+    def list_tasks(self, record_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM make_up_tasks WHERE record_id=? ORDER BY id", (record_id,)).fetchall()
+        return [self._task_row(row) for row in rows]
+
+    def list_batches(self, task_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM make_up_batches WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _lock_record(self, connection: sqlite3.Connection, record_id: int, expected_version: int) -> sqlite3.Row:
+        row = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            connection.rollback()
+            raise NotFound("记录不存在")
+        if int(row["version"]) != int(expected_version):
+            connection.rollback()
+            raise Conflict("版本冲突，请刷新后重试")
+        return row
+
+    @staticmethod
+    def _task_fields(task: Dict[str, Any]) -> tuple:
+        return (
+            task["status"], task["responsible_seller"], task["required_quantity"], task["shortage_quantity"],
+            task["delivered_quantity"], task["due_date"], task["breach_price"], task["penalty_rate"],
+            task["penalty_days"], task["breach_amount"], 1 if task.get("compensation_confirmed") else 0,
+            task.get("compensation_reference", ""),
+        )
+
+    def save_task_and_record(self, record_id: int, expected_version: int, state: str, payload: Dict[str, Any], task_id: int, task: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any], add_batch_quantity: int = None) -> Dict[str, Any]:
+        """补券/违约/赔付：指令与任务在同一事务内提交，并写审计。"""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._lock_record(connection, record_id, expected_version)
+            version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE records SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                (state, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, record_id),
+            )
+            status, seller, required_qty, shortage, delivered, due, price, rate, days, amount, confirmed, comp_ref = self._task_fields(task)
+            connection.execute(
+                """
+                UPDATE make_up_tasks SET status=?,responsible_seller=?,required_quantity=?,shortage_quantity=?,
+                    delivered_quantity=?,due_date=?,breach_price=?,penalty_rate=?,penalty_days=?,breach_amount=?,
+                    compensation_confirmed=?,compensation_reference=?,updated_by=?,updated_at=?
+                WHERE id=?
+                """,
+                (status, seller, required_qty, shortage, delivered, due, price, rate, days, amount, confirmed, comp_ref, actor_id, now, task_id),
+            )
+            if add_batch_quantity is not None:
+                connection.execute(
+                    "INSERT INTO make_up_batches(task_id,record_id,quantity,actor_id,created_at) VALUES(?,?,?,?,?)",
+                    (task_id, record_id, add_batch_quantity, actor_id, now),
+                )
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            task_row = connection.execute("SELECT * FROM make_up_tasks WHERE id=?", (task_id,)).fetchone()
+            connection.commit()
+        return {"record": self._row(result), "task": self._task_row(task_row)}
 
     def add_audit(self, record_id: int, actor_id: str, action: str, details: Dict[str, Any]) -> None:
         with self._connect() as connection:
