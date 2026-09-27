@@ -5,29 +5,203 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>证券结算与企业行动处理</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
-    pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; background: #f7f8fa; }
+    main { max-width: 1100px; margin: auto; }
+    button { padding: .4rem .7rem; cursor: pointer; border: 1px solid #3367d6; background: #fff; color: #3367d6; border-radius: 6px; font-size: .85rem; }
+    button:hover { background: #eef3fe; }
+    button.primary { background: #3367d6; color: #fff; }
+    button.danger { border-color: #c5221f; color: #c5221f; }
+    button.warn { border-color: #e37400; color: #e37400; }
+    table { border-collapse: collapse; width: 100%; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    th, td { padding: .55rem .7rem; border-bottom: 1px solid #eceff3; text-align: left; font-size: .88rem; vertical-align: top; }
+    th { background: #f0f3f7; }
+    .state { font-weight: 600; padding: .1rem .45rem; border-radius: 10px; font-size: .78rem; white-space: nowrap; }
+    .s-captured, .s-approved { background: #e6f4ea; color: #1e7e34; }
+    .s-adjusted { background: #e8f0fe; color: #1a56c4; }
+    .s-settled { background: #e3f2fd; color: #0b63b6; }
+    .s-failed { background: #fce8e6; color: #c5221f; }
+    .s-compensation_pending { background: #fef7e0; color: #b06000; }
+    .s-reversed { background: #eceff1; color: #5f6368; }
+    .gap { color: #c5221f; font-weight: 600; }
+    .panel { background: #fff; border-radius: 8px; padding: 1rem 1.2rem; margin-top: 1.2rem; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    input, select { padding: .35rem .5rem; border: 1px solid #c4ccd4; border-radius: 6px; font-size: .85rem; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .4rem 0; }
+    pre { background: #202733; color: #e6edf3; padding: 1rem; overflow: auto; border-radius: 8px; font-size: .8rem; }
+    .muted { color: #6b7684; font-size: .82rem; }
+    h2 { font-size: 1.05rem; margin: .2rem 0 .8rem; }
+    .timeline li { margin-bottom: .35rem; font-size: .85rem; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
 <main>
   <h1>证券结算与企业行动处理</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
-  <pre id="output">点击上方按钮读取服务状态。</pre>
+  <div class="row">
+    <button class="primary" id="load">刷新记录</button>
+    <button id="stats">状态统计</button>
+    <label class="muted">状态筛选
+      <select id="stateFilter">
+        <option value="">全部</option>
+        <option>captured</option><option>adjusted</option><option>approved</option>
+        <option>failed</option><option>compensation_pending</option>
+        <option>settled</option><option>reversed</option>
+      </select>
+    </label>
+  </div>
+  <div class="panel">
+    <h2>结算指令</h2>
+    <table>
+      <thead><tr><th>ID</th><th>参考号</th><th>证券</th><th>状态</th><th>补券缺口 / 任务状态</th><th>操作</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="6" class="muted">点击“刷新记录”加载。</td></tr></tbody>
+    </table>
+  </div>
+  <div id="detail" class="panel hidden">
+    <h2>处置详情 <span id="detailId"></span></h2>
+    <div id="detailBody"></div>
+    <h2 style="margin-top:1.2rem">审计时间线</h2>
+    <ul class="timeline" id="timeline"></ul>
+  </div>
+  <pre id="output" class="hidden"></pre>
 </main>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+const headers = {"X-User-Id":"demo-officer","X-Role":"admin","X-Org":"demo","Content-Type":"application/json"};
+const STATE_LABELS = {captured:"已录入", adjusted:"已调整", approved:"待交收", settled:"已交收", failed:"交收失败", compensation_pending:"待赔付", reversed:"已冲正"};
+const TASK_LABELS = {open:"补券中", completed:"已补足", breached:"已违约", compensated:"已赔付"};
+
+function esc(v) { return String(v == null ? "" : v).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function stateBadge(s) { return `<span class="state s-${esc(s)}">${esc(STATE_LABELS[s] || s)}</span>`; }
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message || ("HTTP " + res.status));
+  return data;
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+
+async function loadRecords() {
+  const state = document.getElementById("stateFilter").value;
+  const items = (await api("/api/records?limit=50" + (state ? "&state=" + state : ""), {headers})).items;
+  const tbody = document.getElementById("rows");
+  if (!items.length) { tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无记录。</td></tr>'; return; }
+  tbody.innerHTML = items.map(r => {
+    const t = r.replenishment;
+    const gap = t
+      ? `<span class="${t.status === 'open' || t.status === 'breached' ? 'gap' : ''}">缺 ${t.outstanding_quantity} / 应补 ${t.required_quantity}</span><br><span class="muted">${esc(TASK_LABELS[t.status])} · 责任方 ${esc(t.responsible_seller)} · 截止 ${esc(t.due_date)}</span>`
+      : '<span class="muted">—</span>';
+    return `<tr><td>${r.id}</td><td>${esc(r.reference)}</td><td>${esc(r.payload.instrument)}<br><span class="muted">${esc(r.payload.side)} × ${r.payload.quantity} @ ${r.payload.price}</span></td>
+      <td>${stateBadge(r.state)}<br><span class="muted">v${r.version}</span></td><td>${gap}</td>
+      <td><button onclick="showDetail(${r.id})">详情/处置</button></td></tr>`;
+  }).join("");
+}
+
+async function showStats() { showJson(await api("/api/stats", {headers})); }
+
+async function showDetail(id) {
+  const [record, task] = await Promise.all([
+    api("/api/records/" + id, {headers}),
+    api("/api/records/" + id + "/replenishment", {headers}).catch(() => null)
+  ]);
+  const timeline = (await api("/api/records/" + id + "/audit", {headers})).items;
+  document.getElementById("detail").classList.remove("hidden");
+  document.getElementById("detailId").textContent = "#" + id + " " + record.reference;
+  document.getElementById("detailBody").innerHTML = renderDetail(record, task);
+  document.getElementById("timeline").innerHTML = timeline.map(e =>
+    `<li><strong>${esc(e.action)}</strong> <span class="muted">${esc(e.created_at)} · ${esc(e.actor_id)} · v${e.version}</strong><br>${esc((e.details && e.details.summary) || "")}</li>`
+  ).join("");
+  bindActions(id, record.version);
+}
+
+function renderDetail(r, task) {
+  const p = r.payload;
+  let html = `<p>${stateBadge(r.state)} 数量 ${p.quantity}（有效 ${p.effective_quantity || p.adjusted_quantity || p.quantity}） 净额 ${p.net_amount} ${p.currency}</p>`;
+  if (p.fail_reason) html += `<p>失败原因：<strong>${esc(p.fail_reason)}</strong></p>`;
+  if (task && task.id) {
+    html += `<table><thead><tr><th>任务</th><th>责任卖方</th><th>应补</th><th>已补</th><th>缺口</th><th>截止日</th><th>违约金</th><th>赔付</th></tr></thead>
+      <tbody><tr><td>#${task.id} ${esc(TASK_LABELS[task.status] || task.status)}</td>
+      <td>${esc(task.responsible_seller)}</td><td>${task.required_quantity}</td><td>${task.replenished_quantity}</td>
+      <td class="gap">${task.outstanding_quantity}</td><td>${esc(task.due_date)}</td>
+      <td>${task.penalty_amount == null ? "—" : task.penalty_amount}</td>
+      <td>${task.compensation_amount == null ? "—" : task.compensation_amount}</td></tr></tbody></table>`;
+    if (task.lots && task.lots.length) {
+      html += `<p class="muted">补券批次：</p><ul>${task.lots.map(l => `<li>${esc(l.created_at)} 补 ${l.quantity} ${l.note ? "（" + esc(l.note) + "）" : ""}</li>`).join("")}</ul>`;
+    }
+  }
+  html += `<div class="row">${renderActions(r)}</div><div id="actionMsg" class="muted"></div>`;
+  return html;
+}
+
+function renderActions(r) {
+  const t = r.replenishment;
+  const btns = [];
+  if (r.state === "approved") {
+    btns.push(`<button class="danger" data-act="fail">置为失败并建补券任务</button>`);
+    btns.push(`<button class="primary" data-act="settle">交收</button>`);
+  }
+  if (r.state === "failed" && t && t.status === "open") {
+    btns.push(`<button data-act="replenish">登记补券</button>`);
+    btns.push(`<button class="warn" data-act="escalate_compensation">截止日未补足→认定违约</button>`);
+  }
+  if (r.state === "compensation_pending" && t && t.status === "breached") {
+    btns.push(`<button class="primary" data-act="confirm_compensation">确认赔付</button>`);
+  }
+  if (r.state === "settled" || (r.state === "compensation_pending" && t && t.status === "compensated") || r.state === "failed") {
+    btns.push(`<button class="warn" data-act="reverse">冲正</button>`);
+  }
+  return btns.join(" ") || '<span class="muted">当前状态无可执行操作</span>';
+}
+
+const ACTION_FORMS = {
+  fail: [
+    ["fail_reason", "失败原因", "text", "卖方券不足"],
+    ["responsible_seller", "责任卖方", "text", "SELLER-A"],
+    ["shortfall_quantity", "应补数量", "number", 1000],
+    ["due_date", "截止日(YYYY-MM-DD)", "date", ""]
+  ],
+  replenish: [["quantity", "本次补券数量", "number", 100], ["note", "备注", "text", ""]],
+  escalate_compensation: [["penalty_amount", "违约金(留空按未补市值)", "number", ""]],
+  confirm_compensation: [["compensation_amount", "赔付金额(留空=违约金)", "number", ""]],
+  settle: [["delivered_quantity", "交收数量", "number", 1000], ["cash_paid", "交收资金", "number", 0]],
+  reverse: [["reverse_reason", "冲正原因", "text", ""]]
+};
+
+function bindActions(id, version) {
+  document.querySelectorAll("#detailBody [data-act]").forEach(btn => {
+    btn.onclick = () => {
+      const action = btn.dataset.act;
+      const fields = (ACTION_FORMS[action] || []).map(f => {
+        const ph = f[3] === "" ? "" : ` placeholder="${esc(f[3])}"`;
+        return `<label>${esc(f[1])} <input name="${f[0]}" type="${f[2]}"${ph}></label>`;
+      }).join(" ");
+      const msg = document.getElementById("actionMsg");
+      msg.innerHTML = fields + ` <button class="primary" id="doAction">执行 ${esc(action)}</button>`;
+      document.getElementById("doAction").onclick = async () => {
+        const data = {};
+        msg.querySelectorAll("input").forEach(i => {
+          if (i.value === "") return;
+          data[i.name] = i.type === "number" ? Number(i.value) : i.value;
+        });
+        try {
+          const updated = await api(`/api/records/${id}/actions/${action}`, {method: "POST", headers, body: JSON.stringify({expected_version: version, data})});
+          msg.textContent = "执行成功，最新状态：" + updated.state;
+          await loadRecords();
+          await showDetail(id);
+        } catch (e) { msg.textContent = "失败：" + e.message; }
+      };
+    };
+  });
+}
+
+let jsonPanel = null;
+function showJson(data) {
+  const pre = document.getElementById("output");
+  pre.classList.remove("hidden");
+  pre.textContent = JSON.stringify(data, null, 2);
+}
+
+document.getElementById("load").onclick = () => loadRecords().catch(e => alert(e.message));
+document.getElementById("stats").onclick = () => showStats().catch(e => alert(e.message));
+document.getElementById("stateFilter").onchange = () => loadRecords().catch(e => alert(e.message));
+loadRecords().catch(e => alert(e.message));
 </script>
 </body>
 </html>

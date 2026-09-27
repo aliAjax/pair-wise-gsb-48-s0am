@@ -1,17 +1,49 @@
 """证券结算与企业行动处理领域规则与状态转换。"""
+from datetime import date
 from typing import Any, Dict, Iterable, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, iso_date, number, text, text_list
 
 
 INITIAL_STATE = "captured"
 CREATE_ROLES = {'trader'}
-ACTION_ROLES = {'apply_corporate': {'corporate_actions'}, 'approve': {'settlement_officer'}, 'settle': {'settlement_officer'}, 'fail': {'settlement_officer'}, 'reverse': {'corporate_actions', 'settlement_officer'}}
-TRANSITIONS = {'apply_corporate': {'captured': 'adjusted'}, 'approve': {'captured': 'approved', 'adjusted': 'approved'}, 'settle': {'approved': 'settled'}, 'fail': {'approved': 'failed'}, 'reverse': {'settled': 'reversed', 'failed': 'reversed'}}
+ACTION_ROLES = {
+    'apply_corporate': {'corporate_actions'},
+    'approve': {'settlement_officer'},
+    'settle': {'settlement_officer'},
+    'fail': {'settlement_officer'},
+    'replenish': {'settlement_officer'},
+    'escalate_compensation': {'settlement_officer'},
+    'confirm_compensation': {'settlement_officer'},
+    'reverse': {'corporate_actions', 'settlement_officer'},
+}
+TRANSITIONS = {
+    'apply_corporate': {'captured': 'adjusted'},
+    'approve': {'captured': 'approved', 'adjusted': 'approved'},
+    'settle': {'approved': 'settled'},
+    'fail': {'approved': 'failed'},
+    'escalate_compensation': {'failed': 'compensation_pending'},
+    'confirm_compensation': {'compensation_pending': 'compensation_pending'},
+    'reverse': {'settled': 'reversed', 'failed': 'reversed', 'compensation_pending': 'reversed'},
+}
+
+# 补券任务状态
+TASK_OPEN = "open"                    # 补券中，缺口尚未补够
+TASK_COMPLETED = "completed"          # 截止日前分批补够，原指令恢复交收
+TASK_BREACHED = "breached"            # 截止日未补足，违约认定
+TASK_COMPENSATED = "compensated"      # 赔付已确认，可冲正
+TASK_CLOSED_STATES = {TASK_COMPLETED, TASK_BREACHED, TASK_COMPENSATED}
+
+# 仅一条未关闭任务的状态集合
+TASK_UNCLOSED_STATES = {TASK_OPEN, TASK_BREACHED}
 
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
+    TASK_OPEN = TASK_OPEN
+    TASK_COMPLETED = TASK_COMPLETED
+    TASK_BREACHED = TASK_BREACHED
+    TASK_COMPENSATED = TASK_COMPENSATED
 
     def known_role(self, role: str) -> bool:
         all_roles = set(CREATE_ROLES)
@@ -65,6 +97,42 @@ class DomainRules:
             raise Conflict("当前状态不允许执行%s" % action)
         return allowed
 
+    def required_quantity(self, payload: Dict[str, Any]) -> int:
+        return int(payload.get("effective_quantity", payload.get("adjusted_quantity", payload["quantity"])))
+
+    def settlement_price(self, payload: Dict[str, Any]) -> float:
+        return float(payload.get("effective_price", payload.get("adjusted_price", payload["price"])))
+
+    def validate_fail_input(self, data: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        """失败处置：记录原因并生成补券任务所需的责任卖方、应补数量和截止日。"""
+        data = dict(data or {})
+        text(data, "fail_reason")
+        text(data, "responsible_seller")
+        required = self.required_quantity(payload)
+        shortfall = integer(data, "shortfall_quantity", 1, required)
+        iso_date(data, "due_date")
+        return data
+
+    def validate_replenish_input(self, data: Dict[str, Any], task: Dict[str, Any]) -> Tuple[int, str]:
+        """一次补券数量必须为正且不超过当前缺口。"""
+        data = dict(data or {})
+        quantity = integer(data, "quantity", 1)
+        outstanding = int(task["required_quantity"]) - int(task["replenished_quantity"])
+        if quantity > outstanding:
+            raise ValidationError("补券数量超过待补缺口%s" % outstanding)
+        note = text(data, "note") if str(data.get("note", "")).strip() else ""
+        return quantity, note
+
+    def breach_value(self, task: Dict[str, Any], payload: Dict[str, Any]) -> float:
+        outstanding = int(task["required_quantity"]) - int(task["replenished_quantity"])
+        return round(outstanding * self.settlement_price(payload), 2)
+
+    def can_escalate(self, task: Dict[str, Any], today: date) -> bool:
+        if task["status"] != TASK_OPEN:
+            return False
+        due = date.fromisoformat(task["due_date"])
+        return today > due
+
     def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
         new_state = self.require_transition(record, action)
         data = dict(data or {})
@@ -84,7 +152,7 @@ class DomainRules:
         elif action == "settle":
             delivered = integer(data, "delivered_quantity", 0)
             paid = number(data, "cash_paid", 0)
-            required_quantity = int(p.get("effective_quantity", p["quantity"]))
+            required_quantity = self.required_quantity(p)
             if delivered != required_quantity:
                 raise ValidationError("交收证券数量不匹配")
             if paid < float(p["net_amount"]):
@@ -94,8 +162,18 @@ class DomainRules:
             summary = "交收完成"
         elif action == "fail":
             changes["fail_reason"] = text(data, "fail_reason")
-            summary = "交收失败"
+            summary = "交收失败：%s" % changes["fail_reason"]
+        elif action == "escalate_compensation":
+            changes["penalty_amount"] = number(data, "penalty_amount", 0)
+            changes["outstanding_quantity"] = integer(data, "outstanding_quantity", 0)
+            summary = "截止日未补足，按未补市值认定违约，停在待赔付"
+        elif action == "confirm_compensation":
+            changes["compensation_confirmed"] = True
+            changes["compensation_amount"] = number(data, "compensation_amount", 0)
+            summary = "赔付已确认"
         elif action == "reverse":
+            if record["state"] == "compensation_pending" and not p.get("compensation_confirmed"):
+                raise Conflict("赔付确认后才能冲正")
             changes["reverse_reason"] = text(data, "reverse_reason")
             summary = "交收冲正"
         p.update(changes)
